@@ -30,6 +30,7 @@ services:
       - DJANGO_DB_PASSWORD=${POSTGRES_PASSWORD}
   
   # 3. AI
+  # Macbook Pro M4(ARM64) 기준으로 변경
   ai:
     build:
       context: ./ai
@@ -38,14 +39,17 @@ services:
       - "8001:8000"
     volumes:
       - ./ai:/app
+    env_file: 
+      - .env
     
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia        
-              count: 1              
-              capabilities: [gpu]
+    # GPU를 사용하지 않아 주석처리 합니다(차후 주석 삭제 예정)
+    # deploy: 
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia        
+    #           count: 1              
+    #           capabilities: [gpu]
     
   # 4. Frontend
   frontend:
