@@ -14,10 +14,10 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 uvicorn==0.38.0
 
-# GEMINI LLM 활용
+# GPT LLM 활용
 langchain
-langchain-google-genai
 langchain-community
+langchain-openai
 
 # env 가져오는
 python-dotenv
