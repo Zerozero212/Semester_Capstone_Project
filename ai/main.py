@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 import os
 import asyncio
@@ -19,18 +20,13 @@ app = FastAPI(root_path="/ai")
 
 # 1. API 키 설정
 google_api_key = os.environ.get("GOOGLE_API_KEY")
-if not google_api_key:
-    print("❌ Error: GOOGLE_API_KEY가 없습니다.")
 
-# 2. GenAI 클라이언트 초기화 (이미지 생성용)
-# [핵심] API 버전을 명시하여 모델 인식률을 높입니다.
+# 2. GenAI 클라이언트 초기화
 client = genai.Client(
     api_key=google_api_key,
-    http_options={'api_version': 'v1beta'} 
 )
 
 # 3. LangChain LLM 초기화 (텍스트 생성용 - Gemini 2.5 Flash)
-# 사용자 요청대로 2.5 버전을 사용합니다.
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash", 
     temperature=0.7,
@@ -42,64 +38,75 @@ class StoryRequest(BaseModel):
     topic: str
     words: list[str]
 
-# ---------------------------------------------------------
 # [동기 함수] 실제 SDK를 호출하여 이미지를 만드는 부분
-# ---------------------------------------------------------
 def _generate_image_sync(prompt: str):
     """
-    Google GenAI SDK (Imagen 3.0)를 사용하여 이미지를 생성
+    Gemini 2.5 Flash Image 사용 (무료 티어 지원)
+    공식 문서: https://ai.google.dev/gemini-api/docs/image-generation
     """
     try:
-        # [요청하신 모델 적용] imagen-3.0-generate-002
-        response = client.models.generate_images(
-            model='imagen-3.0-generate-002',
-            prompt=prompt,
-            config=types.GenerateImagesConfig(
-                number_of_images=1,
-            )
+        response = client.models.generate_content(
+            model='gemini-2.5-flash-image',
+            contents=prompt,
         )
         
-        # 결과 처리 (PIL Image -> Base64 변환)
-        if response.generated_images:
-            generated_image = response.generated_images[0]
-            image_pil = generated_image.image # PIL Image 객체
-            
-            # 메모리 버퍼에 이미지를 저장하여 Base64로 변환
-            buffered = io.BytesIO()
-            image_pil.save(buffered, format="PNG")
-            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-            return img_str
-            
+        # 사용량 로그 출력
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            usage = response.usage_metadata
+            print(f"이미지 생성 토큰 사용량:")
+            print(f"   - 입력 토큰: {usage.prompt_token_count if hasattr(usage, 'prompt_token_count') else 'N/A'}")
+            print(f"   - 총 토큰: {usage.total_token_count if hasattr(usage, 'total_token_count') else 'N/A'}")
+        
+        # 이미지가 inline_data로 반환됨
+        if response.candidates and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    # inline_data.data는 bytes 객체이므로 base64 문자열로 변환
+                    img_data = part.inline_data.data
+                    
+                    # bytes인 경우 base64 인코딩
+                    if isinstance(img_data, bytes):
+                        return base64.b64encode(img_data).decode('utf-8')
+                    # 이미 문자열인 경우 그대로 반환
+                    return img_data
+        
         return None
     except Exception as e:
-        # 에러 발생 시 로그 출력 (디버깅용)
         print(f"SDK 이미지 생성 중 오류: {e}")
         return None
 
-# ---------------------------------------------------------
 # [비동기 래퍼] FastAPI가 멈추지 않게 스레드로 실행
-# ---------------------------------------------------------
-async def generate_image_for_page(text: str, index: int):
+async def generate_image_for_page(text: str, index: int, max_retries=2):
+    """
+    이미지 생성 with 재시도 로직
+    """
     # 이미지 프롬프트 (동화 내용을 영어 묘사로 변환)
-    image_prompt = f"Cute 3D rendered children's book illustration: {text[:300]}"
+    image_prompt = f"Create a cute 3D rendered children's book illustration: {text[:300]}"
     
-    try:
-        # [핵심] 동기 함수(_generate_image_sync)를 비동기(Thread)로 실행!
-        img_base64 = await asyncio.to_thread(_generate_image_sync, image_prompt)
-        
-        return {
-            "page_no": index + 1,
-            "text": text,
-            "image": img_base64 # 성공 시 문자열, 실패 시 None
-        }
-    except Exception as e:
-        print(f"페이지 {index+1} 처리 실패: {e}")
-        return {"page_no": index + 1, "text": text, "image": None}
+    for attempt in range(max_retries):
+        try:
+            img_base64 = await asyncio.to_thread(_generate_image_sync, image_prompt)
+            
+            if img_base64:
+                return {
+                    "page_no": index + 1,
+                    "text": text,
+                    "image": img_base64
+                }
+            
+            # 실패 시 재시도 전 대기
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+                
+        except Exception as e:
+            print(f"페이지 {index+1} 시도 {attempt+1} 실패: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+    
+    return {"page_no": index + 1, "text": text, "image": None}
 
 
-# ---------------------------------------------------------
 # 프롬프트 및 메인 로직
-# ---------------------------------------------------------
 prompt_template = PromptTemplate.from_template(
     """
     You are a professional children's book writer.
@@ -126,7 +133,25 @@ prompt_template = PromptTemplate.from_template(
 
 @app.get("/")
 def read_root():
-    return {"message": "AI Server running with Gemini 2.5 Flash & Imagen 3.0 (002)"}
+    return {
+        "message": "AI Server running with Gemini 2.5 Flash & Free Image Generation",
+        "info": {
+            "text_model": "gemini-2.5-flash",
+            "image_model": "gemini-2.5-flash-image",
+            "free_tier_limits": {
+                "text": "1500 RPD (Requests Per Day)",
+                "image": "500 RPD"
+            }
+        }
+    }
+
+@app.get("/list-models")
+def list_available_models():
+    try:
+        models = client.models.list()
+        return {"models": [model.name for model in models]}
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.post("/generate-story")
 async def generate_story(req: StoryRequest):
@@ -135,24 +160,157 @@ async def generate_story(req: StoryRequest):
 
     try:
         # [Step 1] 동화 텍스트 생성
+        print("동화 텍스트 생성 중...")
         story_pages = await text_chain.ainvoke({
             "age": req.age,
             "topic": req.topic,
             "words": ", ".join(req.words)
         })
+        print(f"총 {len(story_pages)}개 페이지 생성 완료")
 
-        # [Step 2] 이미지 병렬 생성 (asyncio.gather)
-        tasks = []
-        for i, page_text in enumerate(story_pages):
-            tasks.append(generate_image_for_page(page_text, i))
+        # [Step 2] 이미지 순차 생성 (Rate Limit 방지)
+        # 무료 티어: 500 RPM이지만, 안전하게 천천히 생성
+        final_pages = []
+        total_tokens = 0
         
-        final_pages = await asyncio.gather(*tasks)
+        for i, page_text in enumerate(story_pages):
+            print(f"페이지 {i+1}/{len(story_pages)} 이미지 생성 중...")
+            page_result = await generate_image_for_page(page_text, i)
+            final_pages.append(page_result)
+            
+            # Rate Limit 방지: 각 요청 사이 2초 대기
+            if i < len(story_pages) - 1:
+                await asyncio.sleep(2)
+        
+        print(f"\n전체 동화 생성 완료!")
+        print(f"   - 텍스트: {len(story_pages)} 페이지")
+        print(f"   - 이미지: {sum(1 for p in final_pages if p['image'])} / {len(story_pages)} 성공")
 
-        return {
+        result = {
             "title": f"Fairy Tale: {req.topic}",
             "total_pages": len(final_pages),
-            "pages": final_pages
+            "pages": final_pages,
+            "preview_url": f"/ai/preview-story?title={req.topic}"  # 미리보기 URL 추가
         }
+        
+        # 마지막 생성 결과를 메모리에 저장 (미리보기용)
+        app.state.last_story = result
+        
+        return result
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/preview-story", response_class=HTMLResponse)
+async def preview_story(title: str = "Fairy Tale"):
+    """
+    마지막 생성된 동화를 HTML로 미리보기
+    """
+    if not hasattr(app.state, 'last_story') or not app.state.last_story:
+        return "<h1>No story generated yet. Please generate a story first.</h1>"
+    
+    story = app.state.last_story
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>{story['title']}</title>
+        <style>
+            body {{
+                font-family: 'Comic Sans MS', cursive, sans-serif;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+                background: linear-gradient(to bottom, #87CEEB, #98FB98);
+            }}
+            h1 {{
+                text-align: center;
+                color: #FF6B6B;
+                text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+            }}
+            .page {{
+                background: white;
+                border-radius: 15px;
+                padding: 20px;
+                margin: 20px 0;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            }}
+            .page-number {{
+                color: #666;
+                font-weight: bold;
+                margin-bottom: 10px;
+            }}
+            .text {{
+                line-height: 1.8;
+                color: #333;
+                margin: 15px 0;
+            }}
+            .image {{
+                width: 100%;
+                max-width: 512px;
+                height: auto;
+                border-radius: 10px;
+                margin: 15px auto;
+                display: block;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            .no-image {{
+                background: #f0f0f0;
+                padding: 40px;
+                text-align: center;
+                color: #999;
+                border-radius: 10px;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>📚 {story['title']} 📚</h1>
+        <p style="text-align: center; color: #666;">Total Pages: {story['total_pages']}</p>
+    """
+    
+    for page in story['pages']:
+        html_content += f"""
+        <div class="page">
+            <div class="page-number">📖 Page {page['page_no']}</div>
+            <div class="text">{page['text']}</div>
+        """
+        
+        if page['image']:
+            html_content += f"""
+            <img class="image" src="data:image/png;base64,{page['image']}" alt="Page {page['page_no']} illustration">
+            """
+        else:
+            html_content += """
+            <div class="no-image">🎨 Image generation failed</div>
+            """
+        
+        html_content += "</div>"
+    
+    html_content += """
+    </body>
+    </html>
+    """
+    
+    return html_content
+
+
+@app.get("/preview-image/{page_no}", response_class=Response)
+async def preview_single_image(page_no: int):
+    """
+    특정 페이지의 이미지만 PNG로 반환
+    """
+    if not hasattr(app.state, 'last_story') or not app.state.last_story:
+        raise HTTPException(status_code=404, detail="No story found")
+    
+    story = app.state.last_story
+    page = next((p for p in story['pages'] if p['page_no'] == page_no), None)
+    
+    if not page or not page['image']:
+        raise HTTPException(status_code=404, detail="Image not found")
+    
+    # base64 디코딩하여 이미지 바이너리 반환
+    image_data = base64.b64decode(page['image'])
+    return Response(content=image_data, media_type="image/png")
