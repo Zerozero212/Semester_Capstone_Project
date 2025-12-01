@@ -41,8 +41,8 @@ class StoryRequest(BaseModel):
 
 # 동화 기반 문제생성 모델
 class ProblemRequest(BaseModel):
-    story_text = str # 동화내용 들어가야
-    num_questions: int = 3 # 만들 문제의 개수
+    story_text: str # 동화내용 들어가야
+    num_questions: int = 5 # 만들 문제의 개수
 
 # 문제 선택지 모델
 class ChoiceItem(BaseModel):
@@ -91,7 +91,7 @@ problem_prompt_template = PromptTemplate.from_template(
 
     [Requirements]
     1. Create exactly {num_questions} questions.
-    2. Each question must have **4 choices**.
+    2. Each question must have **5 choices**.
     3. Only **one choice** must be correct (`is_correct`: true).
     4. The questions should test reading comprehension.
     5. Language: English Only.
@@ -105,7 +105,8 @@ problem_prompt_template = PromptTemplate.from_template(
           {{"content": "A Rabbit", "is_correct": true}},
           {{"content": "A Lion", "is_correct": false}},
           {{"content": "A Car", "is_correct": false}},
-          {{"content": "A Tree", "is_correct": false}}
+          {{"content": "A Tree", "is_correct": false}},
+          {{"content": "A Bear", "is_correct": false}}
         ]
       }}
     ]
@@ -115,10 +116,6 @@ problem_prompt_template = PromptTemplate.from_template(
 
 # [동기 함수] 실제 SDK를 호출하여 이미지를 만드는 부분
 def _generate_image_sync(prompt: str):
-    """
-    Gemini 2.5 Flash Image 사용 (무료 티어 지원)
-    공식 문서: https://ai.google.dev/gemini-api/docs/image-generation
-    """
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash-image',
@@ -204,6 +201,7 @@ def list_available_models():
     except Exception as e:
         return {"error": str(e)}
 
+# 동화 생성 api 요청 & 함수
 @app.post("/generate-story")
 async def generate_story(req: StoryRequest):
     text_chain = story_prompt_template | llm | JsonOutputParser()
@@ -246,6 +244,34 @@ async def generate_story(req: StoryRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# 동화기반 문제 생성 api 요청 & 함수
+@app.post("/story-problem", response_model=List[QuestionItem])
+async def story_problem(req: ProblemRequest):
+    """
+    동화 텍스트를 입력받고, 문제를 생성(Question + Choices)
+    """
+    # 체인 연결
+    problem_chain = problem_prompt_template | llm | JsonOutputParser()
+
+    try: 
+        print(f"문제 생성 시작 (동화 길이 : {len(req.story_text)}자)")
+
+        # 비동기 호출로 AI에 요청
+        result = await problem_chain.ainvoke({
+            "story_text" : req.story_text,
+            "num_questions" : req.num_questions
+        })
+
+        print(f"문제 len{(result)}개 생성 완료!")
+
+        return result
+    
+    except Exception as e :
+        print(f"문제 생성 중 에러 발생 : {e}")
+
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/preview-story", response_class=HTMLResponse)
